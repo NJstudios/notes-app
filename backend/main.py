@@ -22,6 +22,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from sqlalchemy import delete
+from sqlalchemy import select
 import enum
 
 
@@ -122,7 +124,7 @@ app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"],
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -138,26 +140,26 @@ async def on_startup():
 
 
 # ------------- Notes endpoints -------------
-
 @app.get("/notes", response_model=list[NoteOut])
 async def list_notes():
     async with async_session() as session:
         result = await session.execute(
-            Note.__table__.select().where(Note.user_id == DEV_USER_ID).order_by(Note.created_at.desc())
+            select(Note).order_by(Note.created_at.desc())
         )
-        notes_rows = result.fetchall()
+        notes = result.scalars().all()
 
-        # Need to load blocks manually (simple N+1 is fine for MVP)
-        notes: list[NoteOut] = []
-        for row in notes_rows:
-            note: Note = Note(**row._mapping)
-            blocks_result = await session.execute(
-                Block.__table__.select().where(Block.note_id == note.id).order_by(Block.position.asc())
+        # We don't need blocks for the dashboard list; return empty blocks arrays.
+        return [
+            NoteOut(
+                id=n.id,
+                title=n.title,
+                created_at=n.created_at,
+                updated_at=n.updated_at,
+                blocks=[],
             )
-            blocks_rows = blocks_result.fetchall()
-            note.blocks = [Block(**b._mapping) for b in blocks_rows]
-            notes.append(NoteOut.model_validate(note))
-        return notes
+            for n in notes
+        ]
+
 
 @app.post("/notes", response_model=NoteOut)
 async def create_note(payload: NoteCreate):
@@ -196,29 +198,59 @@ async def create_note(payload: NoteCreate):
 
 
 
+
 @app.get("/notes/{note_id}", response_model=NoteOut)
 async def get_note(note_id: uuid.UUID):
     async with async_session() as session:
-        note = await session.get(Note, note_id)
-        if not note or note.user_id != DEV_USER_ID:
+        # load the note
+        result = await session.execute(
+            select(Note).where(
+                Note.id == note_id,
+                Note.user_id == DEV_USER_ID,
+            )
+        )
+        note = result.scalar_one_or_none()
+        if note is None:
             raise HTTPException(status_code=404, detail="Note not found")
 
+        # load blocks explicitly
         blocks_result = await session.execute(
-            Block.__table__.select().where(Block.note_id == note.id).order_by(Block.position.asc())
+            select(Block).where(Block.note_id == note.id).order_by(Block.position)
         )
-        blocks_rows = blocks_result.fetchall()
-        note.blocks = [Block(**b._mapping) for b in blocks_rows]
-        return NoteOut.model_validate(note)
+        blocks = list(blocks_result.scalars())
 
+        # build the Pydantic response explicitly, DO NOT touch note.blocks
+        return NoteOut(
+            id=note.id,
+            title=note.title,
+            created_at=note.created_at,
+            updated_at=note.updated_at,
+            blocks=[BlockOut.model_validate(b) for b in blocks],
+        )
 
 @app.delete("/notes/{note_id}")
 async def delete_note(note_id: uuid.UUID):
     async with async_session() as session:
-        note = await session.get(Note, note_id)
-        if not note or note.user_id != DEV_USER_ID:
+        # find the note for this user
+        result = await session.execute(
+            select(Note).where(
+                Note.id == note_id,
+                Note.user_id == DEV_USER_ID,
+            )
+        )
+        note = result.scalar_one_or_none()
+        if note is None:
             raise HTTPException(status_code=404, detail="Note not found")
+
+        # explicitly delete blocks so we never touch note.blocks / lazy-load
+        await session.execute(
+            delete(Block).where(Block.note_id == note.id)
+        )
+
+        # delete the note row
         await session.delete(note)
         await session.commit()
+
         return {"ok": True}
 
 
