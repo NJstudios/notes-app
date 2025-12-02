@@ -1,0 +1,14 @@
+# Node / Next
+node_modules
+.next
+out
+dist
+
+# Python
+backend/.venv/
+
+# Environment files
+backend/.env
+frontend/.env.local
+.env
+.env.*
